@@ -1,25 +1,37 @@
+/******************************************************
+ * GithubDisplay ESP32 Provision + Display (All-in-One)
+ * - Always attempts WiFi auto-connect, fallback to AP
+ * - Captive portal includes Device ID field
+ * - Fetches API_URL/<DEVICE_ID> JSON and displays it
+ ******************************************************/
+
 #include <Adafruit_NeoPixel.h>
-#include <WiFi.h>
-#include <HTTPClient.h>
-#include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
+#include <HTTPClient.h>
+#include <Preferences.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <WiFiManager.h>
 
-// ---- LED strip ----
-#define LED_PIN 5
-#define NUM_LEDS 256
-#define BRIGHTNESS 5
-Adafruit_NeoPixel strip(NUM_LEDS, LED_PIN, NEO_GRB + NEO_KHZ800);
+// ---------- Pins / LEDs ----------
+static const int STATUS_LED = 2;
+static const int STRIP_PIN = 5;
+static const int NUM_LEDS = 256;
+static const int STRIP_BRIGHTNESS = 5;
 
-// ---- Status LED (optional onboard) ----
-#define STATUS_LED 2
+Adafruit_NeoPixel strip(NUM_LEDS, STRIP_PIN, NEO_GRB + NEO_KHZ800);
 
-// ---- WiFi & API ----
-const char* WIFI_SSID = "Alon iPhone";
-const char* WIFI_PASS = "12345678";
-const char* API_URL   = "https://github-display-server.vercel.app/api/phultquist";
+// ---------- Server ----------
+const char *API_BASE = "https://github-display-server.vercel.app/api";
 
-// ---- Helpers ----
-void setStatusBlink(int times, int on_ms = 150, int off_ms = 150) {
+// ---------- Device ID storage ----------
+Preferences prefs;
+String DEVICE_ID = "";
+const char *NVS_NS = "gd";
+const char *NVS_KEY_DEVICE_ID = "device_id";
+
+// ---------- Helpers ----------
+void statusBlink(int times, int on_ms = 150, int off_ms = 150) {
   for (int i = 0; i < times; i++) {
     digitalWrite(STATUS_LED, HIGH);
     delay(on_ms);
@@ -28,41 +40,49 @@ void setStatusBlink(int times, int on_ms = 150, int off_ms = 150) {
   }
 }
 
-bool connectWiFi() {
-  Serial.println("\nConnecting to WiFi...");
-  WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-
-  for (int i = 0; i < 30; i++) {
-    if (WiFi.status() == WL_CONNECTED) {
-      Serial.printf("✅ WiFi connected: %s\n", WiFi.localIP().toString().c_str());
-      digitalWrite(STATUS_LED, HIGH);
-      return true;
-    }
-    setStatusBlink(1, 100, 200);
-  }
-  Serial.println("❌ WiFi connect failed.");
-  return false;
+void stripClear() {
+  for (int i = 0; i < NUM_LEDS; i++)
+    strip.setPixelColor(i, 0);
+  strip.show();
 }
 
-void clearStrip() {
-  for (int i = 0; i < NUM_LEDS; i++) strip.setPixelColor(i, 0);
+void stripShowGreenGrid(const JsonArray &rows) {
+  int idx = 0;
+  for (JsonArray row : rows) {
+    for (JsonVariant v : row) {
+      if (idx >= NUM_LEDS)
+        break;
+      int g = constrain((int)v.as<int>(), 0, 255);
+      strip.setPixelColor(idx, strip.Color(0, g, 0));
+      idx++;
+    }
+    if (idx >= NUM_LEDS)
+      break;
+  }
+  for (int i = idx; i < NUM_LEDS; i++)
+    strip.setPixelColor(i, 0);
   strip.show();
 }
 
 bool fetchAndDisplay() {
-  WiFiClientSecure client;
-  client.setInsecure();
-  HTTPClient https;
-
-  Serial.printf("Fetching: %s\n", API_URL);
-  if (!https.begin(client, API_URL)) {
-    Serial.println("Failed to start HTTPS.");
+  if (DEVICE_ID.isEmpty()) {
+    Serial.println("❌ No DEVICE_ID stored!");
     return false;
   }
 
-  https.addHeader("User-Agent", "ESP32");
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  String url = String(API_BASE) + "/" + DEVICE_ID;
+  Serial.printf("🌐 Fetching: %s\n", url.c_str());
+
+  HTTPClient https;
+  if (!https.begin(client, url)) {
+    Serial.println("HTTPS begin() failed");
+    return false;
+  }
+
+  https.addHeader("User-Agent", "ESP32-GithubDisplay");
   int code = https.GET();
   if (code != HTTP_CODE_OK) {
     Serial.printf("HTTP error: %d\n", code);
@@ -73,7 +93,6 @@ bool fetchAndDisplay() {
   String payload = https.getString();
   https.end();
 
-  // Parse JSON: {"username":"...","data":[[...32...], ... 8 rows ...]}
   DynamicJsonDocument doc(12288);
   DeserializationError err = deserializeJson(doc, payload);
   if (err) {
@@ -84,57 +103,103 @@ bool fetchAndDisplay() {
 
   JsonArray rows = doc["data"].as<JsonArray>();
   if (rows.isNull()) {
-    Serial.println("No 'data' array found.");
+    Serial.println("❌ No 'data' array in payload.");
     return false;
   }
 
-  // Flatten and write ONLY GREEN channel; brightness varies by 0-255 value.
-  int idx = 0;
-  for (JsonArray row : rows) {
-    for (JsonVariant v : row) {
-      if (idx >= NUM_LEDS) break;
-      int g = constrain((int)v.as<int>(), 0, 255);
-      strip.setPixelColor(idx, strip.Color(0, g, 0)); // green only
-      idx++;
-    }
-    if (idx >= NUM_LEDS) break;
-  }
-
-  // Zero any remaining pixels if provided data < NUM_LEDS
-  for (int i = idx; i < NUM_LEDS; i++) {
-    strip.setPixelColor(i, 0);
-  }
-
-  strip.show();
-  Serial.printf("Updated %d pixels from API data (green intensity).\n", idx);
+  stripShowGreenGrid(rows);
+  Serial.println("✅ Display updated.");
   return true;
 }
 
+bool runProvisioningPortal() {
+  Serial.println("🚪 Starting WiFiManager captive portal...");
+  WiFi.mode(WIFI_AP_STA);
+  WiFiManager wm;
+
+  prefs.begin(NVS_NS, false);
+  DEVICE_ID = prefs.getString(NVS_KEY_DEVICE_ID, "");
+  prefs.end();
+
+  WiFiManagerParameter p_dev("device_id", "Device ID", DEVICE_ID.c_str(), 32);
+  wm.addParameter(&p_dev);
+
+  wm.setConfigPortalBlocking(true);
+  wm.setConnectTimeout(10);
+  wm.setConfigPortalTimeout(180); // 3 minutes max open
+
+  bool res = wm.autoConnect("GithubDisplay-Setup");
+  if (!res) {
+    Serial.println("❌ AutoConnect failed — user likely timed out.");
+    return false;
+  }
+
+  String newId = p_dev.getValue();
+  newId.trim();
+  if (newId.length()) {
+    prefs.begin(NVS_NS, false);
+    prefs.putString(NVS_KEY_DEVICE_ID, newId);
+    prefs.end();
+    DEVICE_ID = newId;
+    Serial.printf("💾 Saved Device ID: %s\n", DEVICE_ID.c_str());
+  }
+
+  Serial.printf("✅ Connected! IP: %s\n", WiFi.localIP().toString().c_str());
+  digitalWrite(STATUS_LED, HIGH);
+  return true;
+}
+
+// ---------- Setup ----------
 void setup() {
   Serial.begin(115200);
+  delay(500);
+  Serial.println("\n=== GithubDisplay Boot ===");
+
   pinMode(STATUS_LED, OUTPUT);
   digitalWrite(STATUS_LED, LOW);
 
   strip.begin();
-  strip.setBrightness(BRIGHTNESS); // keep brightness at 5
-  strip.show();
+  strip.setBrightness(STRIP_BRIGHTNESS);
+  stripClear();
 
-  connectWiFi();
+  // Always start clean
+  WiFi.disconnect(true, true);
+  delay(500);
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.setSleep(false);
+
+  // Try to connect automatically — if fails, AP starts
+  if (!runProvisioningPortal()) {
+    Serial.println("Portal or connection failed. Rebooting in 5s...");
+    statusBlink(10, 100, 100);
+    delay(5000);
+    ESP.restart();
+  }
+
+  prefs.begin(NVS_NS, false);
+  DEVICE_ID = prefs.getString(NVS_KEY_DEVICE_ID, "");
+  prefs.end();
+  Serial.printf("Device ID: %s\n", DEVICE_ID.c_str());
+
   if (!fetchAndDisplay()) {
-    Serial.println("Initial fetch failed, clearing strip.");
-    clearStrip();
+    Serial.println("Initial fetch failed; clearing LEDs.");
+    stripClear();
+    statusBlink(3, 150, 150);
   }
 }
 
+// ---------- Loop ----------
 void loop() {
   if (WiFi.status() != WL_CONNECTED) {
-    digitalWrite(STATUS_LED, LOW);
-    connectWiFi();
+    Serial.println("WiFi lost. Reconnecting...");
+    WiFi.reconnect();
+    delay(3000);
+    return;
   }
 
   if (!fetchAndDisplay()) {
-    setStatusBlink(3, 80, 120);
+    statusBlink(3, 80, 120);
   }
 
-  delay(10000); // fetch every 10 seconds
+  delay(10000); // update every 10s
 }
