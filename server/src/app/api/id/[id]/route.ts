@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 
 // Device ID to username mapping
 const deviceIdToUsername: Record<string, string> = {
-  "1": "phultquist",
+  "1": "alonzuman",
   // Add more mappings as needed
 };
 
