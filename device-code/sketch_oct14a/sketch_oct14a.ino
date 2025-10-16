@@ -1,14 +1,14 @@
 /******************************************************
  * GithubDisplay ESP32 Provision + Display (All-in-One)
  * - Always attempts WiFi auto-connect, fallback to AP
- * - Captive portal includes Device ID field
+ * - Device ID is hard-coded to "1"
+ * - To clear WiFi: Press RESET, then press+hold BOOT for 2s (within 3s window)
  * - Fetches API_URL/<DEVICE_ID> JSON and displays it
  ******************************************************/
 
 #include <Adafruit_NeoPixel.h>
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
-#include <Preferences.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <WiFiManager.h>
@@ -18,17 +18,15 @@ static const int STATUS_LED = 2;
 static const int STRIP_PIN = 5;
 static const int NUM_LEDS = 256;
 static const int STRIP_BRIGHTNESS = 5;
+static const int BOOT_BUTTON = 0; // GPIO 0 - boot/flash button
 
 Adafruit_NeoPixel strip(NUM_LEDS, STRIP_PIN, NEO_GRB + NEO_KHZ800);
 
 // ---------- Server ----------
 const char *API_BASE = "https://github-display-server.vercel.app/api";
 
-// ---------- Device ID storage ----------
-Preferences prefs;
-String DEVICE_ID = "";
-const char *NVS_NS = "gd";
-const char *NVS_KEY_DEVICE_ID = "device_id";
+// ---------- Device ID ----------
+const String DEVICE_ID = "1"; // Hard-coded Device ID
 
 // ---------- Helpers ----------
 void statusBlink(int times, int on_ms = 150, int off_ms = 150) {
@@ -117,13 +115,6 @@ bool runProvisioningPortal() {
   WiFi.mode(WIFI_AP_STA);
   WiFiManager wm;
 
-  prefs.begin(NVS_NS, false);
-  DEVICE_ID = prefs.getString(NVS_KEY_DEVICE_ID, "");
-  prefs.end();
-
-  WiFiManagerParameter p_dev("device_id", "Device ID", DEVICE_ID.c_str(), 32);
-  wm.addParameter(&p_dev);
-
   wm.setConfigPortalBlocking(true);
   wm.setConnectTimeout(10);
   wm.setConfigPortalTimeout(180); // 3 minutes max open
@@ -132,16 +123,6 @@ bool runProvisioningPortal() {
   if (!res) {
     Serial.println("❌ AutoConnect failed — user likely timed out.");
     return false;
-  }
-
-  String newId = p_dev.getValue();
-  newId.trim();
-  if (newId.length()) {
-    prefs.begin(NVS_NS, false);
-    prefs.putString(NVS_KEY_DEVICE_ID, newId);
-    prefs.end();
-    DEVICE_ID = newId;
-    Serial.printf("💾 Saved Device ID: %s\n", DEVICE_ID.c_str());
   }
 
   Serial.printf("✅ Connected! IP: %s\n", WiFi.localIP().toString().c_str());
@@ -157,10 +138,62 @@ void setup() {
 
   pinMode(STATUS_LED, OUTPUT);
   digitalWrite(STATUS_LED, LOW);
+  
+  pinMode(BOOT_BUTTON, INPUT_PULLUP);
 
   strip.begin();
   strip.setBrightness(STRIP_BRIGHTNESS);
   stripClear();
+
+  // Give user 3 seconds to press BOOT button after reset
+  // This avoids triggering bootloader mode
+  Serial.println("💡 Press and hold BOOT button now to clear WiFi (3 sec window)...");
+  
+  unsigned long startTime = millis();
+  bool buttonPressed = false;
+  
+  // Wait up to 3 seconds for button press
+  while (millis() - startTime < 3000) {
+    if (digitalRead(BOOT_BUTTON) == LOW) {
+      buttonPressed = true;
+      break;
+    }
+    delay(50);
+  }
+  
+  if (buttonPressed) {
+    Serial.println("🔄 BOOT button detected - hold for 2 seconds to clear WiFi...");
+    
+    // Wait 2 seconds while checking button is still held
+    bool stillPressed = true;
+    for (int i = 0; i < 20; i++) {
+      delay(100);
+      if (digitalRead(BOOT_BUTTON) != LOW) {
+        stillPressed = false;
+        break;
+      }
+      // Blink during wait
+      digitalWrite(STATUS_LED, (i % 2 == 0) ? HIGH : LOW);
+    }
+    
+    digitalWrite(STATUS_LED, LOW);
+    
+    if (stillPressed) {
+      Serial.println("🔄 Clearing WiFi credentials...");
+      statusBlink(5, 100, 100);
+      
+      WiFiManager wm;
+      wm.resetSettings();
+      
+      Serial.println("✅ WiFi credentials cleared! Device will start AP mode.");
+      statusBlink(3, 500, 500);
+      delay(1000);
+    } else {
+      Serial.println("❌ Button not held long enough - skipping reset.");
+    }
+  } else {
+    Serial.println("✅ No button press detected - continuing normal boot.");
+  }
 
   // Always start clean
   WiFi.disconnect(true, true);
@@ -176,9 +209,6 @@ void setup() {
     ESP.restart();
   }
 
-  prefs.begin(NVS_NS, false);
-  DEVICE_ID = prefs.getString(NVS_KEY_DEVICE_ID, "");
-  prefs.end();
   Serial.printf("Device ID: %s\n", DEVICE_ID.c_str());
 
   if (!fetchAndDisplay()) {
